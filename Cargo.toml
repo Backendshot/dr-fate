@@ -1,0 +1,28 @@
+[package]
+name = "dr-fate"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8.4", features = ["multipart", "macros" ] }           # or latest
+tokio = { version = "1.47.1", features = [ "full" ] }
+serde = { version = "1.0.219", features = [ "derive"] }
+serde_json = "1.0.143"
+tower = { version = "0.5.2", features = [ "full" ] }
+tower-http = { version = "0.6.6", features = [ "trace", "cors", "compression-zstd", "compression-gzip", "limit", "request-id", "timeout", "metrics", "validate-request", "auth" ] }   # for TraceLayer (and CORS if you add it)
+tracing-subscriber = "0.3.20"
+tracing = "0.1.41"
+hyper = "1.7.0"
+dotenvy = "0.15.7"
+sqlx = { version = "0.8.6", features = [ "runtime-tokio-rustls", "postgres", "chrono" ] }
+reqwest = { version = "0.12.23", features = [ "json", "gzip", "rustls-tls"] }
+futures = "0.3.31"
+uuid = { version = "1.18.1", features = [ "v4" ] }
+chrono = { version = "0.4.42", features = [ "serde" ] }
+# lettre was removed due to dependency issues with rustls 0.21 and ring 0.17 not being compatible and causing build failures and linking errors.
+# lettre = { version = "0.11.18", default-features = false, features = [ "builder", "hostname", "smtp-transport", "pool", "tokio1-rustls", "ring", "rustls-platform-verifier" ] }
+argon2 = { version = "0.5.3", features = [ "password-hash" ] }
+fancy-regex = "0.16.1"
+jsonwebtoken = "9.3.1"
+async-mailer = "0.5.0"
+tower_governor = "0.8.0"
