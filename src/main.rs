@@ -1,20 +1,31 @@
+use dr_fate::response::{not_found, internal_server_error, bad_request, unauthorized};
 use argon2::{Argon2, PasswordVerifier};
 use async_mailer::Mailer;
+use async_mailer::{IntoMessage, MessageBuilder, SmtpMailer};
 use axum::{
-    extract::{Multipart, Path, State, Query},
-    http::{header::HeaderMap, StatusCode},
+    Json, Router,
+    extract::{Multipart, Path, Query, State},
+    http::{StatusCode, header::HeaderMap},
     response::IntoResponse,
     routing::{delete, get, patch, post},
-    Json, Router,
 };
 use dotenvy::dotenv;
 use fancy_regex::Regex;
-use async_mailer::{IntoMessage, MessageBuilder, SmtpMailer};
+use listenfd::ListenFd;
+use reqwest::header;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{PgPool, Postgres, Row, Transaction, Executor};
+use sqlx::{Executor, PgPool, Postgres, Row, Transaction};
+use tracing_subscriber::EnvFilter;
+use std::fmt::Display;
+use std::time::Duration;
+use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
+use tokio::{
+    net::TcpListener,
+    signal
+};
 use tower::ServiceBuilder;
-use tower_governor::{governor::GovernorConfig, GovernorLayer};
+use tower_governor::{GovernorLayer, governor::GovernorConfig};
 use tower_http::{
     compression::{CompressionLayer, CompressionLevel},
     cors::CorsLayer,
@@ -24,12 +35,8 @@ use tower_http::{
     validate_request::ValidateRequestHeaderLayer,
 };
 use tracing::Level;
-use std::fmt::Display;
-use std::time::Duration;
-use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
-use reqwest::header;
 
 #[derive(Clone)]
 struct AppState {
@@ -152,10 +159,25 @@ struct GlobalResponse {
     errors: Option<serde_json::Value>,
 }
 
+#[derive(Debug)]
+struct ErrorResponse(StatusCode, String);
+
+impl IntoResponse for ErrorResponse {
+    fn into_response(self) -> axum::response::Response {
+        (self.0, Json(self.1)).into_response()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // setup logging
-    tracing_subscriber::registry().with(fmt::layer()).init();
+    tracing_subscriber::registry()
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}=debug,tower_http=debug,axum::rejection=trace", env!("CARGO_CRATE_NAME")).into()),
+        )
+        .with(fmt::layer())
+        .init();
 
     // initial state
     // let state = AppState {
@@ -182,12 +204,12 @@ async fn main() {
         .on_response(DefaultOnResponse::new().level(Level::INFO))
         .on_failure(DefaultOnFailure::new().level(Level::ERROR));
 
-    let cors_layer = CorsLayer::permissive();
+    let cors_layer = CorsLayer::permissive(); //should narrow this down later on
 
     let compression_layer = CompressionLayer::new()
-                                .zstd(true)
-                                .gzip(true)
-                                .quality(CompressionLevel::Default); // uses zstd with gzip as backup
+        .zstd(true)
+        .gzip(true)
+        .quality(CompressionLevel::Default); // uses zstd with gzip as backup
 
     // let set_request_id_layer = SetRequestIdLayer::new( HeaderName::from_static("x-request-id", );
 
@@ -200,6 +222,12 @@ async fn main() {
     let governor_config = GovernorConfig::default();
 
     let rate_limit_layer = GovernorLayer::new(governor_config);
+
+    let bearer_token =
+        env::var("BEARER_TOKEN").expect("BEARER_TOKEN environment variable must be set");
+    let bearer_auth_layer = ValidateRequestHeaderLayer::bearer(&bearer_token);
+
+    let content_accept_layer = ValidateRequestHeaderLayer::accept("application/json");
 
     // Routes
     let login_route = Router::new()
@@ -238,27 +266,69 @@ async fn main() {
         .nest("/todos", todo_api_route)
         .nest("/api/v2", todo_db_route)
         .with_state(state)
-        .layer(ServiceBuilder::new() //order matters
-            .layer(trace_layer)
-            .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
-            .layer(cors_layer)
-            .layer(compression_layer)  // 10 MB limit (uses zstd with gzip as backup)
-            .layer(rate_limit_layer) // 100 requests per minute
-            .layer(timeout_layer) // 30 seconds timeout
-            .layer(ValidateRequestHeaderLayer::bearer("UMTC"))
-            .layer(ValidateRequestHeaderLayer::accept("application/json"))
-        );
+        .layer(
+            ServiceBuilder::new() //order matters
+                .layer(trace_layer)
+                .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))// 10 MB limit
+                .layer(cors_layer)
+                .layer(compression_layer)  //(uses zstd with gzip as backup)
+                .layer(rate_limit_layer) // 100 requests per minute
+                .layer(timeout_layer) // 30 seconds timeout
+                .layer(bearer_auth_layer)
+                .layer(content_accept_layer),
+        )
+        .fallback(not_found);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr> = app.into_make_service_with_connect_info::<SocketAddr>();
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 6942));
+
+    let mut listenfd = ListenFd::from_env();
+
+    let listener = match listenfd.take_tcp_listener(0).unwrap() {
+        // if we are given a tcp listener on listen fd 0, we use that one
+        Some(listener) => {
+            listener.set_nonblocking(true).unwrap(); //if this is used, use "systemfd --no-pid -s http::6842 - cargo watch -x run"
+            TcpListener::from_std(listener).unwrap()
+        }
+        // otherwise fall back to local listening
+        None => TcpListener::bind("127.0.0.1:6942").await.unwrap(),
+    };
     tracing::info!("listening on {}", addr);
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, service)
+        .with_graceful_shutdown(signal_shutdown())
+        .await
+        .unwrap()
 }
 
+//Signal for graceful shutdown
+async fn signal_shutdown() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
 
 /* Handlers */
 
-async fn fetch_todos() -> Result<impl IntoResponse, (StatusCode, String)> {
+async fn fetch_todos() -> Result<impl IntoResponse, ErrorResponse> {
     // let items = sqlx::query("SELECT id, name, description FROM items WHERE deleted = FALSE")
     //     .fetch_all(&*state.db)
     //     .await
@@ -280,15 +350,15 @@ async fn fetch_todos() -> Result<impl IntoResponse, (StatusCode, String)> {
     let todos = reqwest::get("https://jsonplaceholder.typicode.com/todos")
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to fetch todos: {}", e),
             )
         })?
-        .json::<Vec<HashMap<String, serde_json::Value>>>()
+        .json::<Vec<Todo>>()
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to parse todos: {}", e),
             )
@@ -297,7 +367,7 @@ async fn fetch_todos() -> Result<impl IntoResponse, (StatusCode, String)> {
     Ok((StatusCode::OK, Json(todos)))
 }
 
-async fn fetch_todo_by_id(Path(id): Path<u64>) -> Result<impl IntoResponse, (StatusCode, String)> {
+async fn fetch_todo_by_id(Path(id): Path<u64>) -> Result<impl IntoResponse, ErrorResponse> {
     // let todo = sqlx::query("SELECT id, name, description FROM items WHERE id = $1 AND deleted = FALSE")
     //     .bind(id)
     //     .fetch_one(&*state.db)
@@ -312,7 +382,7 @@ async fn fetch_todo_by_id(Path(id): Path<u64>) -> Result<impl IntoResponse, (Sta
     let todos = reqwest::get("https://jsonplaceholder.typicode.com/todos")
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to fetch todos: {}", e),
             )
@@ -320,7 +390,7 @@ async fn fetch_todo_by_id(Path(id): Path<u64>) -> Result<impl IntoResponse, (Sta
         .json::<Vec<HashMap<String, serde_json::Value>>>()
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to parse todos: {}", e),
             )
@@ -330,7 +400,7 @@ async fn fetch_todo_by_id(Path(id): Path<u64>) -> Result<impl IntoResponse, (Sta
         .into_iter()
         .find(|todo| todo.get("id").and_then(|v| v.as_u64()) == Some(id))
         .ok_or_else(|| {
-            (
+            ErrorResponse(
                 StatusCode::NOT_FOUND,
                 format!("Todo with id {} not found", id),
             )
@@ -341,11 +411,11 @@ async fn fetch_todo_by_id(Path(id): Path<u64>) -> Result<impl IntoResponse, (Sta
 
 async fn import_todo_data(
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let todos = reqwest::get("https://jsonplaceholder.typicode.com/todos")
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to fetch todos: {}", e),
             )
@@ -353,14 +423,14 @@ async fn import_todo_data(
         .json::<Vec<HashMap<String, serde_json::Value>>>()
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to parse todos: {}", e),
             )
         })?;
 
     let mut tx: Transaction<'_, Postgres> = state.db.begin().await.map_err(|e| {
-        (
+        ErrorResponse(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to start transaction: {}", e),
         )
@@ -387,7 +457,7 @@ async fn import_todo_data(
         .execute(&mut *tx)
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to execute statement: {}", e),
             )
@@ -395,7 +465,7 @@ async fn import_todo_data(
     }
 
     tx.commit().await.map_err(|e| {
-        (
+        ErrorResponse(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to commit transaction: {}", e),
         )
@@ -404,14 +474,12 @@ async fn import_todo_data(
     Ok((StatusCode::OK, "Imported todos successfully"))
 }
 
-async fn read_all_todos(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+async fn read_all_todos(State(state): State<AppState>) -> Result<impl IntoResponse, ErrorResponse> {
     let items = sqlx::query("SELECT user_id, id, title, completed FROM get_all_todos()")
         .fetch_all(&*state.db)
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to fetch items: {}", e),
             )
@@ -431,13 +499,12 @@ async fn read_all_todos(
 async fn view_all_todos_by_id(
     Path(user_id): Path<i32>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let items = sqlx::query("SELECT user_id, id, title, completed FROM todos WHERE user_id = $1 AND is_deleted = FALSE ORDER BY id ASC")
         .bind(user_id)
         .fetch_all(&*state.db)
         .await
-        .map_err(|e| {
-            (
+        .map_err(|e| { ErrorResponse (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to fetch items: {}", e),
             )
@@ -457,7 +524,7 @@ async fn view_all_todos_by_id(
 async fn create_todo(
     State(state): State<AppState>,
     Json(payload): Json<Todo>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let result = sqlx::query("INSERT INTO todos (user_id, title, completed, is_deleted) VALUES ($1, $2, $3, $4) RETURNING id")
         .bind(payload.user_id)
         .bind(payload.title)
@@ -465,8 +532,7 @@ async fn create_todo(
         .bind(false)
         .fetch_one(&*state.db)
         .await
-        .map_err(|e| {
-            (
+        .map_err(|e| { ErrorResponse (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to insert item: {}", e),
             )
@@ -481,7 +547,7 @@ async fn update_todo(
     Path(id): Path<i32>,
     State(state): State<AppState>,
     Json(payload): Json<Todo>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let result = sqlx::query(
         "UPDATE todos SET title = $1, completed = $2 WHERE id = $3 AND is_deleted = FALSE",
     )
@@ -491,14 +557,14 @@ async fn update_todo(
     .execute(&*state.db)
     .await
     .map_err(|e| {
-        (
+        ErrorResponse(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to update item: {}", e),
         )
     })?;
 
     if result.rows_affected() == 0 {
-        return Err((
+        return Err(ErrorResponse(
             StatusCode::NOT_FOUND,
             format!("Todo with id {} not found", id),
         ));
@@ -510,21 +576,21 @@ async fn update_todo(
 async fn delete_todo(
     Path(id): Path<i32>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let result = sqlx::query("CALL delete_todo($1, $2)")
         .bind(id)
         .bind(false)
         .execute(&*state.db)
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to delete item: {}", e),
             )
         })?;
 
     if result.rows_affected() == 0 {
-        return Err((
+        return Err(ErrorResponse(
             StatusCode::NOT_FOUND,
             format!("Todo with id {} not found", id),
         ));
@@ -536,20 +602,20 @@ async fn delete_todo(
 async fn update_delete_status(
     Path(id): Path<i32>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let result = sqlx::query("UPDATE todos SET is_deleted = TRUE WHERE id = $1")
         .bind(id)
         .execute(&*state.db)
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to update delete status: {}", e),
             )
         })?;
 
     if result.rows_affected() == 0 {
-        return Err((
+        return Err(ErrorResponse(
             StatusCode::NOT_FOUND,
             format!("Todo with id {} not found", id),
         ));
@@ -562,7 +628,7 @@ async fn update_delete_status(
 async fn register(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let mut form_fields = HashMap::new();
     let mut image_file_name = String::new();
 
@@ -571,7 +637,7 @@ async fn register(
     let now = chrono::Utc::now().naive_utc();
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (
+        ErrorResponse(
             StatusCode::BAD_REQUEST,
             format!("Failed to read multipart field: {}", e),
         )
@@ -584,7 +650,7 @@ async fn register(
                     .unwrap_or("application/octet-stream")
                     .to_string();
                 let data = field.bytes().await.map_err(|e| {
-                    (
+                    ErrorResponse(
                         StatusCode::BAD_REQUEST,
                         format!("Failed to read file data: {}", e),
                     )
@@ -600,7 +666,7 @@ async fn register(
                 image_file_name = upload_image_to_cloud(file_name, data.to_vec(), "image-uploads")
                     .await
                     .map_err(|e| {
-                        (
+                        ErrorResponse(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("Failed to upload image: {}", e),
                         )
@@ -609,7 +675,7 @@ async fn register(
             _ => {
                 let name = field.name().unwrap_or("").to_string();
                 let value = field.text().await.map_err(|e| {
-                    (
+                    ErrorResponse(
                         StatusCode::BAD_REQUEST,
                         format!("Failed to read field value: {}", e),
                     )
@@ -649,15 +715,18 @@ async fn register(
 
     let info_errors = validate_information(&information);
     if let Err(errors) = info_errors {
-        return Err((StatusCode::BAD_REQUEST, errors));
+        return Err(ErrorResponse(StatusCode::BAD_REQUEST, errors));
     }
 
     if !form_fields.contains_key("password") || form_fields.get("password").unwrap().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Password is required".to_string()));
+        return Err(ErrorResponse(
+            StatusCode::BAD_REQUEST,
+            "Password is required".to_string(),
+        ));
     }
 
     if form_fields.get("password").unwrap().len() < minimum_password_length {
-        return Err((
+        return Err(ErrorResponse(
             StatusCode::BAD_REQUEST,
             "Password must be at least 8 characters long".to_string(),
         ));
@@ -680,7 +749,7 @@ async fn register(
         )
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to insert user: {}", e),
             )
@@ -694,7 +763,7 @@ async fn register(
         )
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to fetch user after insertion: {}", e),
             )
@@ -716,11 +785,17 @@ async fn register(
 
     //credentials blank checks
     if (credentials.username).trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Username is required".to_string()));
+        return Err(ErrorResponse(
+            StatusCode::BAD_REQUEST,
+            "Username is required".to_string(),
+        ));
     }
 
     if (credentials.password).trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Password is required".to_string()));
+        return Err(ErrorResponse(
+            StatusCode::BAD_REQUEST,
+            "Password is required".to_string(),
+        ));
     }
 
     //credentials sanitization
@@ -751,7 +826,7 @@ async fn register(
 
     //credentials validation
     if credentials.password.len() < minimum_password_length {
-        return Err((
+        return Err(ErrorResponse(
             StatusCode::BAD_REQUEST,
             "Password must be at least 8 characters long".to_string(),
         ));
@@ -764,7 +839,7 @@ async fn register(
         .is_match(&credentials.password)
         .unwrap_or(false)
     {
-        return Err((
+        return Err(ErrorResponse(
             StatusCode::BAD_REQUEST,
             "Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character".to_string(),
         ));
@@ -775,7 +850,7 @@ async fn register(
         .is_match(&credentials.username)
         .unwrap_or(false)
     {
-        return Err((
+        return Err(ErrorResponse(
             StatusCode::BAD_REQUEST,
             "Username must be at least 3 characters long and can only contain letters, numbers, dots, hyphens, or underscores".to_string(),
         ));
@@ -792,7 +867,7 @@ async fn register(
         )
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to insert credentials: {}", e),
             )
@@ -829,7 +904,7 @@ async fn register(
     };
 
     let access_token = get_gmail_access_token().await.map_err(|e| {
-        (
+        ErrorResponse(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to get Gmail access token: {}", e),
         )
@@ -838,7 +913,7 @@ async fn register(
     send_verification_email(&email_logs, &access_token, &state)
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to send verification email: {}", e),
             )
@@ -853,10 +928,10 @@ async fn register(
 async fn verify_email(
     query: Query<HashMap<String, String>>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let user_id = query.get("user_id").and_then(|v| v.parse::<i32>().ok());
     if user_id.is_none() {
-        return Err((
+        return Err(ErrorResponse(
             StatusCode::BAD_REQUEST,
             "User ID was not passed successfully".to_string(),
         ));
@@ -878,7 +953,7 @@ async fn verify_email(
         )
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to update user: {}", e),
             )
@@ -1047,7 +1122,7 @@ async fn send_verification_email(
         )
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to insert email logs: {}", e),
             )
@@ -1127,44 +1202,66 @@ async fn hash_password(password: String) -> String {
 async fn login(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(payload): Json<LoginPayload>
-) -> Result<Json<LoginResponse>, (StatusCode, String)> {
+    Json(payload): Json<LoginPayload>,
+) -> Result<Json<LoginResponse>, ErrorResponse> {
     let username = payload.username;
     let password = payload.password;
 
     let browser_info = headers
         .get("User-Agent")
-        .ok_or((StatusCode::BAD_REQUEST, "Missing User-Agent header".into()))?
+        .ok_or(ErrorResponse(
+            StatusCode::BAD_REQUEST,
+            "Missing User-Agent header".into(),
+        ))?
         .to_str()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid User-Agent header".into()))?;
+        .map_err(|_| ErrorResponse(StatusCode::BAD_REQUEST, "Invalid User-Agent header".into()))?;
 
     let ip_address = headers
         .get("X-Forwarded-For")
-        .ok_or((StatusCode::BAD_REQUEST, "Missing X-Forwarded-For header".into()))?
+        .ok_or(ErrorResponse(
+            StatusCode::BAD_REQUEST,
+            "Missing X-Forwarded-For header".into(),
+        ))?
         .to_str()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid X-Forwarded-For header".into()))?;
+        .map_err(|_| {
+            ErrorResponse(
+                StatusCode::BAD_REQUEST,
+                "Invalid X-Forwarded-For header".into(),
+            )
+        })?;
 
     // unimplemented!("Validation for login data");
 
     let (user_id, hashed_password) = get_user_id_and_hashed_password(username.clone(), &state)
         .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, e))?
-        .ok_or((StatusCode::UNAUTHORIZED, "Invalid credentials".into()))?;
+        .map_err(|e| ErrorResponse(StatusCode::UNAUTHORIZED, e))?
+        .ok_or(ErrorResponse(
+            StatusCode::UNAUTHORIZED,
+            "Invalid credentials".into(),
+        ))?;
 
     if !verify_password(password.clone(), hashed_password.clone()).await {
-        return Err((StatusCode::UNAUTHORIZED, "Invalid credentials".into()));
+        return Err(ErrorResponse(
+            StatusCode::UNAUTHORIZED,
+            "Invalid credentials".into(),
+        ));
     }
 
     if !check_email_status(user_id, &state)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(|e| ErrorResponse(StatusCode::INTERNAL_SERVER_ERROR, e))
         .unwrap()
     {
-        return Err((StatusCode::UNAUTHORIZED, "Email not verified".into()));
+        return Err(ErrorResponse(
+            StatusCode::UNAUTHORIZED,
+            "Email not verified".into(),
+        ));
     }
 
     //Generate JWT and session
-    let jwt_token = generate_jwt(user_id).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let jwt_token = generate_jwt(user_id)
+        .await
+        .map_err(|e| ErrorResponse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let session_id = Uuid::new_v4().to_string(); //different from the original implementation of 16-length byte random string
 
@@ -1178,14 +1275,17 @@ async fn login(
         &state,
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(|e| ErrorResponse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Log the login attempt
     insert_audit_log(user_id, browser_info, &state)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| ErrorResponse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    println!("User {} logged in from IP: {}, Browser: {}", user_id, ip_address, browser_info);
+    println!(
+        "User {} logged in from IP: {}, Browser: {}",
+        user_id, ip_address, browser_info
+    );
 
     Ok(Json(LoginResponse {
         user_id,
@@ -1198,8 +1298,8 @@ async fn login(
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
-   user_id: i32,
-   iat: usize,
+    user_id: i32,
+    iat: usize,
 }
 
 async fn generate_jwt(user_id: i32) -> Result<String, String> {
@@ -1220,7 +1320,10 @@ async fn generate_jwt(user_id: i32) -> Result<String, String> {
 
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-        &Claims { user_id, iat: chrono::Utc::now().timestamp() as usize },
+        &Claims {
+            user_id,
+            iat: chrono::Utc::now().timestamp() as usize,
+        },
         &jsonwebtoken::EncodingKey::from_secret(secret_token.as_bytes()),
     )
     .map_err(|e| format!("Failed to generate JWT: {}", e))?;
@@ -1228,7 +1331,11 @@ async fn generate_jwt(user_id: i32) -> Result<String, String> {
     Ok(token)
 }
 
-async fn insert_audit_log(user_id: i32, browser_info: &str, state: &AppState) -> Result<(), String> {
+async fn insert_audit_log(
+    user_id: i32,
+    browser_info: &str,
+    state: &AppState,
+) -> Result<(), String> {
     // let now = chrono::Utc::now().naive_utc();
     // let user_agent = user_agent_parser::UserAgentParser::new();
     // let parsed_ua = user_agent.parse(browser_info);
@@ -1348,15 +1455,13 @@ async fn verify_password(password: String, hashed_password: String) -> bool {
 async fn retrieve_profile_image(
     Path(user_id): Path<i32>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let image_name: Option<String> = state
         .db
-        .fetch_optional(
-            sqlx::query("SELECT image FROM tbl_information WHERE id = ?").bind(user_id),
-        )
+        .fetch_optional(sqlx::query("SELECT image FROM tbl_information WHERE id = ?").bind(user_id))
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to fetch user image: {}", e),
             )
@@ -1365,7 +1470,10 @@ async fn retrieve_profile_image(
 
     if let Some(image_name) = image_name {
         if image_name.is_empty() {
-            return Err((StatusCode::NOT_FOUND, "No profile image found".to_string()));
+            return Err(ErrorResponse(
+                StatusCode::NOT_FOUND,
+                "No profile image found".to_string(),
+            ));
         }
 
         let supabase_url = env::var("SUPABASE_URL").expect("SUPABASE_URL is not set");
@@ -1380,14 +1488,18 @@ async fn retrieve_profile_image(
             .bearer_auth(supabase_key)
             .send()
             .await
-            .map_err(|e| format!("Failed to fetch image from Supabase: {}", e)).unwrap();
+            .map_err(|e| format!("Failed to fetch image from Supabase: {}", e))
+            .unwrap();
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err((StatusCode::NOT_FOUND, "Profile image not found".to_string()));
+            return Err(ErrorResponse(
+                StatusCode::NOT_FOUND,
+                "Profile image not found".to_string(),
+            ));
         }
 
         if !response.status().is_success() {
-            return Err((
+            return Err(ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to fetch image, status: {}", response.status()),
             ));
@@ -1401,7 +1513,7 @@ async fn retrieve_profile_image(
             .to_string();
 
         let bytes = response.bytes().await.map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to read image bytes: {}", e),
             )
@@ -1413,22 +1525,23 @@ async fn retrieve_profile_image(
             bytes,
         ))
     } else {
-        Err((StatusCode::NOT_FOUND, "No profile image found".to_string()))
+        Err(ErrorResponse(
+            StatusCode::NOT_FOUND,
+            "No profile image found".to_string(),
+        ))
     }
 }
 
 async fn update_profile_image(
     Path(user_id): Path<i32>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let image_name: Option<String> = state
         .db
-        .fetch_optional(
-            sqlx::query("SELECT image FROM tbl_information WHERE id = ?").bind(user_id),
-        )
+        .fetch_optional(sqlx::query("SELECT image FROM tbl_information WHERE id = ?").bind(user_id))
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to fetch user image: {}", e),
             )
@@ -1447,13 +1560,16 @@ async fn update_profile_image(
             .bearer_auth(supabase_key)
             .send()
             .await
-            .map_err(|e| format!("Failed to delete image from Supabase: {}", e
-            )).unwrap();
+            .map_err(|e| format!("Failed to delete image from Supabase: {}", e))
+            .unwrap();
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err((StatusCode::NOT_FOUND, "Profile image not found".to_string()));
+            return Err(ErrorResponse(
+                StatusCode::NOT_FOUND,
+                "Profile image not found".to_string(),
+            ));
         }
         if !response.status().is_success() {
-            return Err((
+            return Err(ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to delete image, status: {}", response.status()),
             ));
@@ -1465,7 +1581,7 @@ async fn update_profile_image(
 async fn logout(
     Path(user_id): Path<i32>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let result = state
         .db
         .execute(
@@ -1475,15 +1591,14 @@ async fn logout(
             .bind(user_id),
         )
         .await
-        .map_err(|e| {
-            (
+        .map_err(|e| { ErrorResponse (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to logout user: {}", e),
             )
         })?;
 
     if result.rows_affected() == 0 {
-        return Err((
+        return Err(ErrorResponse(
             StatusCode::NOT_FOUND,
             format!("User with id {} not found", user_id),
         ));
@@ -1495,20 +1610,23 @@ async fn logout(
 async fn audit_user(
     Path(user_id): Path<i32>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let result = state
         .db
-        .fetch_all(sqlx::query("SELECT * FROM audit_trail WHERE user_id = $1 ORDER BY timestamp DESC").bind(user_id))
+        .fetch_all(
+            sqlx::query("SELECT * FROM audit_trail WHERE user_id = $1 ORDER BY timestamp DESC")
+                .bind(user_id),
+        )
         .await
         .map_err(|e| {
-            (
+            ErrorResponse(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to audit user: {}", e),
             )
         })?;
 
     if result.is_empty() {
-        return Err((
+        return Err(ErrorResponse(
             StatusCode::NOT_FOUND,
             format!("User with id {} not found", user_id),
         ));
