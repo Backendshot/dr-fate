@@ -288,7 +288,7 @@ async fn main() {
     let listener = match listenfd.take_tcp_listener(0).unwrap() {
         // if we are given a tcp listener on listen fd 0, we use that one
         Some(listener) => {
-            listener.set_nonblocking(true).unwrap(); //if this is used, use "systemfd --no-pid -s http::6842 - cargo watch -x run"
+            listener.set_nonblocking(true).unwrap(); //if this is used, use "systemfd --no-pid -s http::6942 - cargo watch -x run"
             TcpListener::from_std(listener).unwrap()
         }
         // otherwise fall back to local listening
@@ -758,7 +758,7 @@ async fn register(
     let row = state
         .db
         .fetch_one(
-            sqlx::query("SELECT id, email FROM tbl_information WHERE username = ?")
+            sqlx::query("SELECT id, email FROM tbl_information WHERE username = $1")
                 .bind(&information.username),
         )
         .await
@@ -1362,7 +1362,7 @@ async fn insert_audit_log(
     state
         .db
         .execute(
-            sqlx::query("INSERT INTO audit_trail (user_id, timestamp, browser) VALUES (?, ?, ?) RETURNING id, user_id, timestamp, browser")
+            sqlx::query("INSERT INTO audit_trail (user_id, timestamp, browser) VALUES ($1, $2, $3) RETURNING id, user_id, timestamp, browser")
                 .bind(user_id)
                 .bind(now)
                 .bind(browser),
@@ -1380,7 +1380,7 @@ async fn get_user_id_and_hashed_password(
     let row = state
         .db
         .fetch_optional(
-            sqlx::query("SELECT user_id, password FROM tbl_credentials WHERE username = ?")
+            sqlx::query("SELECT user_id, password FROM tbl_credentials WHERE username = $1")
                 .bind(username),
         )
         .await
@@ -1399,7 +1399,7 @@ async fn check_email_status(user_id: i32, state: &AppState) -> Result<bool, Stri
     let email_logs: Option<String> = state
         .db
         .fetch_optional(
-            sqlx::query("SELECT status FROM tbl_email_sending WHERE user_id = ?").bind(user_id),
+            sqlx::query("SELECT status FROM tbl_email_sending WHERE user_id = $1").bind(user_id),
         )
         .await
         .map_err(|e| format!("Failed to fetch email logs: {}", e))?
@@ -1458,7 +1458,7 @@ async fn retrieve_profile_image(
 ) -> Result<impl IntoResponse, ErrorResponse> {
     let image_name: Option<String> = state
         .db
-        .fetch_optional(sqlx::query("SELECT image FROM tbl_information WHERE id = ?").bind(user_id))
+        .fetch_optional(sqlx::query("SELECT image FROM tbl_information WHERE id = $1").bind(user_id))
         .await
         .map_err(|e| {
             ErrorResponse(
@@ -1538,7 +1538,7 @@ async fn update_profile_image(
 ) -> Result<impl IntoResponse, ErrorResponse> {
     let image_name: Option<String> = state
         .db
-        .fetch_optional(sqlx::query("SELECT image FROM tbl_information WHERE id = ?").bind(user_id))
+        .fetch_optional(sqlx::query("SELECT image FROM tbl_information WHERE id = $1").bind(user_id))
         .await
         .map_err(|e| {
             ErrorResponse(
@@ -1586,7 +1586,7 @@ async fn logout(
         .db
         .execute(
             sqlx::query(
-                "UPDATE tbl_credentials SET active_session = FALSE, jwt_token = NULL, active_session_deleted = TRUE WHERE user_id = ?",
+                "UPDATE tbl_credentials SET active_session = FALSE, jwt_token = NULL, active_session_deleted = TRUE WHERE user_id = $1",
             )
             .bind(user_id),
         )
