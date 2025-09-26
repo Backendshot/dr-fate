@@ -1,4 +1,3 @@
-use dr_fate::response::{not_found, internal_server_error, bad_request, unauthorized};
 use argon2::{Argon2, PasswordVerifier};
 use async_mailer::Mailer;
 use async_mailer::{IntoMessage, MessageBuilder, SmtpMailer};
@@ -10,20 +9,17 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use dotenvy::dotenv;
+use dr_fate::response::{bad_request, internal_server_error, not_found, unauthorized};
 use fancy_regex::Regex;
 use listenfd::ListenFd;
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{Executor, PgPool, Postgres, Row, Transaction};
-use tracing_subscriber::EnvFilter;
+use sqlx::{Executor, PgPool, Postgres, Row, Transaction, query};
 use std::fmt::Display;
 use std::time::Duration;
 use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
-use tokio::{
-    net::TcpListener,
-    signal
-};
+use tokio::{net::TcpListener, signal};
 use tower::ServiceBuilder;
 use tower_governor::{GovernorLayer, governor::GovernorConfig};
 use tower_http::{
@@ -35,6 +31,7 @@ use tower_http::{
     validate_request::ValidateRequestHeaderLayer,
 };
 use tracing::Level;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -113,16 +110,23 @@ impl Display for EmailVerificationSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct LoginPayload {
+struct UsernameLoginPayload {
     user_id: Option<i32>,
     username: String,
     password: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct EmailLoginPayload {
+    user_id: Option<i32>,
+    email: String,
+    password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LoginResponse {
     user_id: i32,
-    username: String,
+    content: String,
     jwt_token: String,
     active_session: String,
     active_session_deleted: bool,
@@ -172,10 +176,13 @@ impl IntoResponse for ErrorResponse {
 async fn main() {
     // setup logging
     tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| format!("{}=debug,tower_http=debug,axum::rejection=trace", env!("CARGO_CRATE_NAME")).into()),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            format!(
+                "{}=debug,tower_http=debug,axum::rejection=trace",
+                env!("CARGO_CRATE_NAME")
+            )
+            .into()
+        }))
         .with(fmt::layer())
         .init();
 
@@ -231,7 +238,8 @@ async fn main() {
 
     // Routes
     let login_route = Router::new()
-        .route("/login", post(login))
+        .route("/username/login", post(login_by_username))
+        .route("/email/login", post(login_by_email))
         .route(
             "/profile-image/{user_id}",
             get(retrieve_profile_image).layer(compression_layer.clone()),
@@ -269,9 +277,9 @@ async fn main() {
         .layer(
             ServiceBuilder::new() //order matters
                 .layer(trace_layer)
-                .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))// 10 MB limit
+                .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)) // 10 MB limit
                 .layer(cors_layer)
-                .layer(compression_layer)  //(uses zstd with gzip as backup)
+                .layer(compression_layer) //(uses zstd with gzip as backup)
                 .layer(rate_limit_layer) // 100 requests per minute
                 .layer(timeout_layer) // 30 seconds timeout
                 .layer(bearer_auth_layer)
@@ -279,7 +287,8 @@ async fn main() {
         )
         .fallback(not_found);
 
-    let service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr> = app.into_make_service_with_connect_info::<SocketAddr>();
+    let service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr> =
+        app.into_make_service_with_connect_info::<SocketAddr>();
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 6942));
 
@@ -288,7 +297,7 @@ async fn main() {
     let listener = match listenfd.take_tcp_listener(0).unwrap() {
         // if we are given a tcp listener on listen fd 0, we use that one
         Some(listener) => {
-            listener.set_nonblocking(true).unwrap(); //if this is used, use "systemfd --no-pid -s http::6942 - cargo watch -x run"
+            listener.set_nonblocking(true).unwrap(); //if this is used, use "systemfd --no-pid -s http::6942 -- cargo watch -x run"
             TcpListener::from_std(listener).unwrap()
         }
         // otherwise fall back to local listening
@@ -1199,10 +1208,10 @@ async fn hash_password(password: String) -> String {
         .collect()
 }
 
-async fn login(
+async fn login_by_username(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(payload): Json<LoginPayload>,
+    Json(payload): Json<UsernameLoginPayload>,
 ) -> Result<Json<LoginResponse>, ErrorResponse> {
     let username = payload.username;
     let password = payload.password;
@@ -1232,7 +1241,104 @@ async fn login(
 
     // unimplemented!("Validation for login data");
 
-    let (user_id, hashed_password) = get_user_id_and_hashed_password(username.clone(), &state)
+    let (user_id, hashed_password) = get_user_id_and_hashed_password_by_username(&username, &state)
+        .await
+        .map_err(|e| ErrorResponse(StatusCode::UNAUTHORIZED, e))?
+        .ok_or(ErrorResponse(
+            StatusCode::UNAUTHORIZED,
+            "Invalid credentials".into(),
+        ))?;
+
+    if !verify_password(password.clone(), hashed_password.clone()).await {
+        return Err(ErrorResponse(
+            StatusCode::UNAUTHORIZED,
+            "Invalid credentials".into(),
+        ));
+    }
+
+    if !check_email_status(user_id, &state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        .unwrap()
+    {
+        return Err(ErrorResponse(
+            StatusCode::UNAUTHORIZED,
+            "Email not verified".into(),
+        ));
+    }
+
+    //Generate JWT and session
+    let jwt_token = generate_jwt(user_id)
+        .await
+        .map_err(|e| ErrorResponse(StatusCode::UNAUTHORIZED, e))?;
+
+    let session_id = Uuid::new_v4().to_string(); //different from the original implementation of 16-length byte random string
+
+    let session_deleted = false;
+
+    update_session(
+        user_id,
+        session_id.clone(),
+        jwt_token.clone(),
+        session_deleted,
+        &state,
+    )
+    .await
+    .map_err(|e| ErrorResponse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Log the login attempt
+    insert_audit_log(user_id, browser_info, &state)
+        .await
+        .map_err(|e| ErrorResponse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    println!(
+        "User {} logged in from IP: {}, Browser: {}",
+        user_id, ip_address, browser_info
+    );
+
+    Ok(Json(LoginResponse {
+        user_id,
+        content: username,
+        jwt_token,
+        active_session: session_id,
+        active_session_deleted: session_deleted,
+    }))
+}
+
+async fn login_by_email(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<EmailLoginPayload>,
+) -> Result<Json<LoginResponse>, ErrorResponse> {
+    let email = payload.email;
+    let password = payload.password;
+
+    let browser_info = headers
+        .get("User-Agent")
+        .ok_or(ErrorResponse(
+            StatusCode::BAD_REQUEST,
+            "Missing User-Agent header".into(),
+        ))?
+        .to_str()
+        .map_err(|_| ErrorResponse(StatusCode::BAD_REQUEST, "Invalid User-Agent header".into()))?;
+
+    let ip_address = headers
+        .get("X-Forwarded-For")
+        .ok_or(ErrorResponse(
+            StatusCode::BAD_REQUEST,
+            "Missing X-Forwarded-For header".into(),
+        ))?
+        .to_str()
+        .map_err(|_| {
+            ErrorResponse(
+                StatusCode::BAD_REQUEST,
+                "Invalid X-Forwarded-For header".into(),
+            )
+        })?;
+
+    // unimplemented!("Validation for login data");
+
+    let (user_id, hashed_password) = get_user_id_and_hashed_password_by_email(&email, &state)
         .await
         .map_err(|e| ErrorResponse(StatusCode::UNAUTHORIZED, e))?
         .ok_or(ErrorResponse(
@@ -1289,7 +1395,7 @@ async fn login(
 
     Ok(Json(LoginResponse {
         user_id,
-        username,
+        content: email,
         jwt_token,
         active_session: session_id,
         active_session_deleted: session_deleted,
@@ -1373,16 +1479,38 @@ async fn insert_audit_log(
     Ok(())
 }
 
+async fn get_user_id_and_hashed_password_by_username(
+    username: &str,
+    state: &AppState,
+) -> Result<Option<(i32, String)>, String> {
+    get_user_id_and_hashed_password(
+        username,
+        "SELECT user_id, password FROM tbl_credentials WHERE username = $1",
+        state,
+    )
+    .await
+}
+
+async fn get_user_id_and_hashed_password_by_email(
+    email: &str,
+    state: &AppState,
+) -> Result<Option<(i32, String)>, String> {
+    get_user_id_and_hashed_password(
+        email,
+        "SELECT user_id, password FROM tbl_credentials WHERE email = $1",
+        state,
+    )
+    .await
+}
+
 async fn get_user_id_and_hashed_password(
-    username: String,
+    content: &str,
+    query: &str,
     state: &AppState,
 ) -> Result<Option<(i32, String)>, String> {
     let row = state
         .db
-        .fetch_optional(
-            sqlx::query("SELECT user_id, password FROM tbl_credentials WHERE username = $1")
-                .bind(username),
-        )
+        .fetch_optional(sqlx::query(query).bind(content))
         .await
         .map_err(|e| format!("Failed to fetch user: {}", e))?;
 
@@ -1458,7 +1586,9 @@ async fn retrieve_profile_image(
 ) -> Result<impl IntoResponse, ErrorResponse> {
     let image_name: Option<String> = state
         .db
-        .fetch_optional(sqlx::query("SELECT image FROM tbl_information WHERE id = $1").bind(user_id))
+        .fetch_optional(
+            sqlx::query("SELECT image FROM tbl_information WHERE id = $1").bind(user_id),
+        )
         .await
         .map_err(|e| {
             ErrorResponse(
@@ -1538,7 +1668,9 @@ async fn update_profile_image(
 ) -> Result<impl IntoResponse, ErrorResponse> {
     let image_name: Option<String> = state
         .db
-        .fetch_optional(sqlx::query("SELECT image FROM tbl_information WHERE id = $1").bind(user_id))
+        .fetch_optional(
+            sqlx::query("SELECT image FROM tbl_information WHERE id = $1").bind(user_id),
+        )
         .await
         .map_err(|e| {
             ErrorResponse(
