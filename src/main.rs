@@ -232,7 +232,7 @@ async fn main() {
 
     let bearer_token =
         env::var("BEARER_TOKEN").expect("BEARER_TOKEN environment variable must be set");
-    let bearer_auth_layer = ValidateRequestHeaderLayer::bearer(&bearer_token);
+    // let bearer_auth_layer = ValidateRequestHeaderLayer::bearer(&bearer_token);
 
     let content_accept_layer = ValidateRequestHeaderLayer::accept("application/json");
 
@@ -282,7 +282,7 @@ async fn main() {
                 .layer(compression_layer) //(uses zstd with gzip as backup)
                 .layer(rate_limit_layer) // 100 requests per minute
                 .layer(timeout_layer) // 30 seconds timeout
-                .layer(bearer_auth_layer)
+                // .layer(bearer_auth_layer)
                 .layer(content_accept_layer),
         )
         .fallback(not_found);
