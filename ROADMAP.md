@@ -15,3 +15,7 @@ b. Swagger/OpenAPI
 3. Testing
 a. Unit Testing
 b. Integration Testing
+4. Miscellaneous
+a. Audit Logs
+- Website Audit (what browser was used)
+- Operation Audit (what operation was performed, who changed what, and what changed)
