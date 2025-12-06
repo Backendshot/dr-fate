@@ -21,3 +21,6 @@ target
 #.idea/
 
 .env
+/target
+.shuttle*
+Secrets*.toml

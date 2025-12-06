@@ -172,8 +172,9 @@ impl IntoResponse for ErrorResponse {
     }
 }
 
-#[tokio::main]
-async fn main() {
+// #[tokio::main]
+#[shuttle_runtime::main]
+async fn main(#[shuttle_shared_db::Postgres] pool: PgPool) -> shuttle_axum::ShuttleAxum {
     // setup logging
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -287,27 +288,29 @@ async fn main() {
         )
         .fallback(not_found);
 
-    let service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr> =
-        app.into_make_service_with_connect_info::<SocketAddr>();
+    // let service: axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr> =
+    //     app.into_make_service_with_connect_info::<SocketAddr>();
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 6942));
+    // let addr = SocketAddr::from(([127, 0, 0, 1], 6942));
 
-    let mut listenfd = ListenFd::from_env();
+    // let mut listenfd = ListenFd::from_env();
 
-    let listener = match listenfd.take_tcp_listener(0).unwrap() {
-        // if we are given a tcp listener on listen fd 0, we use that one
-        Some(listener) => {
-            listener.set_nonblocking(true).unwrap(); //if this is used, use "systemfd --no-pid -s http::6942 -- cargo watch -x run"
-            TcpListener::from_std(listener).unwrap()
-        }
-        // otherwise fall back to local listening
-        None => TcpListener::bind("127.0.0.1:6942").await.unwrap(),
-    };
-    tracing::info!("listening on {}", addr);
-    axum::serve(listener, service)
-        .with_graceful_shutdown(signal_shutdown())
-        .await
-        .unwrap()
+    // let listener = match listenfd.take_tcp_listener(0).unwrap() {
+    //     // if we are given a tcp listener on listen fd 0, we use that one
+    //     Some(listener) => {
+    //         listener.set_nonblocking(true).unwrap(); //if this is used, use "systemfd --no-pid -s http::6942 -- cargo watch -x run"
+    //         TcpListener::from_std(listener).unwrap()
+    //     }
+    //     // otherwise fall back to local listening
+    //     None => TcpListener::bind("127.0.0.1:6942").await.unwrap(),
+    // };
+    // tracing::info!("listening on {}", addr);
+    // axum::serve(listener, service)
+    //     .with_graceful_shutdown(signal_shutdown())
+    //     .await
+    //     .unwrap()
+
+    Ok(app.into())
 }
 
 //Signal for graceful shutdown

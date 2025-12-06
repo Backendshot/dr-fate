@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 axum = { version = "0.8.4", features = ["multipart", "macros" ] }           # or latest
 tokio = { version = "1.47.1", features = [ "full" ] }
-serde = { version = "1.0.219", features = [ "derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 tower = { version = "0.5.2", features = [ "full" ] }
 tower-http = { version = "0.6.6", features = [ "trace", "cors", "compression-zstd", "compression-gzip", "limit", "request-id", "timeout", "metrics", "validate-request", "auth" ] }   # for TraceLayer (and CORS if you add it)
@@ -27,3 +27,7 @@ jsonwebtoken = "9.3.1"
 async-mailer = "0.5.0"
 tower_governor = "0.8.0"
 listenfd = "1.0.2"
+shuttle = "0.8.1"
+shuttle-runtime = "0.57.0"
+shuttle-axum = "0.57.0"
+shuttle-shared-db = { version = "0.57.0", features = ["postgres", "sqlx"] }
